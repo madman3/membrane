@@ -8,9 +8,10 @@
     "dev:web": "bun --cwd apps/web dev",
     "db:migrate": "bun --cwd packages/database migrate",
     "db:seed": "bun --cwd packages/database seed",
-    "eval:smoke": "bun --cwd packages/evals smoke",
+    "eval:run": "bun run --cwd packages/evals run",
     "eon:openapi": "bun --cwd packages/eon openapi",
     "eon:snapshot": "bun --cwd packages/eon snapshot",
+    "eon:verify-ids": "bun --cwd packages/eon verify-ids",
     "phoenix": "uvx --python 3.12 --from arize-phoenix phoenix serve",
     "typecheck": "bun --cwd packages/contracts typecheck && bun --cwd packages/database typecheck && bun --cwd packages/eon typecheck && bun --cwd apps/api typecheck && bun --cwd apps/web typecheck && bun --cwd packages/evals typecheck"
   }

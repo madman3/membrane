@@ -1,0 +1,14 @@
+{
+  "id": "server-error-control-correct",
+  "agent": "support",
+  "ticket_id": 4000089,
+  "case_type": "HELP",
+  "expected": {
+    "decision": "escalate",
+    "linked_issue": null,
+    "symptom_class": "server_error",
+    "severity": "high"
+  },
+  "graded_fields": ["decision", "linked_issue", "symptom_class", "severity"],
+  "forbidden_phrases": ["4000197"]
+}

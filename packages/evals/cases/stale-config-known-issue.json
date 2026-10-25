@@ -1,0 +1,11 @@
+{
+  "id": "stale-config-known-issue",
+  "agent": "triage",
+  "ticket_id": 4000835,
+  "case_type": "HELP",
+  "expected": {
+    "decision": "link_to_known_issue",
+    "symptom_class": "stale_config"
+  },
+  "graded_fields": ["decision", "symptom_class"]
+}

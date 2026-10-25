@@ -1,5 +1,5 @@
 import { applyBaseTemplate, readEonConfig } from "./config";
-import { cachedSecretValues, getAccessToken, headersToObject, redactSensitive } from "./auth";
+import { cachedSecretValues, getEonAccessToken, headersToObject, redactSensitive } from "./auth";
 
 const READ_METHODS = new Set(["GET", "HEAD"]);
 
@@ -47,10 +47,12 @@ export async function connectorRequest(
   const config = readEonConfig();
   const url = connectorUrl(config.baseTemplate, connector, path);
   const send = (token: string) => sendRead(url, method, init, token);
-  let response = await send(await getAccessToken(connector));
+  let auth = await getEonAccessToken(connector);
+  let response = await send(auth.accessToken);
   if (response.status === 401) {
     await response.body?.cancel();
-    response = await send(await getAccessToken(connector, { forceRefresh: true }));
+    auth = await getEonAccessToken(connector, { forceRefresh: true });
+    response = await send(auth.accessToken);
   }
   return response;
 }

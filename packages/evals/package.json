@@ -6,7 +6,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "smoke": "bun --env-file=../../.env src/smoke.ts",
+    "run": "bun --env-file=../../.env src/run.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

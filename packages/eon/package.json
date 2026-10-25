@@ -8,6 +8,7 @@
   "scripts": {
     "openapi": "bun --env-file=../../.env src/openapi.ts",
     "snapshot": "bun --env-file=../../.env src/snapshot.ts",
+    "verify-ids": "bun --env-file=../../.env src/verify-ids.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

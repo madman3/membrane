@@ -9,7 +9,7 @@ if (!collectorEndpoint) {
   );
 }
 
-export const INSTRUMENTATION_PROJECT = "synthetic-memory-smoke";
+export const INSTRUMENTATION_PROJECT = "real-eon-memory-verdict";
 
 export const tracerProvider = register({
   projectName: INSTRUMENTATION_PROJECT,

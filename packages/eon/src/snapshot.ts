@@ -2,23 +2,32 @@ import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { redactKnownSecrets } from "./auth";
-import { connectorRequest, eonFetch, EonHttpError } from "./client";
-import { applyBaseTemplate, normalizeConnectorName, readEonConfig } from "./config";
-import {
-  SEARCH_RELS,
-  collectReferences,
-  describeOperations,
-  findSearchOperation,
-  hasRel,
-  isOpenApiDocument,
-  parseLinkHeader,
-  readStoredOpenApi,
-  referenceSearch,
-  shouldParseJson,
-  topLevelKeys,
-  type SearchOperation,
-} from "./openapi";
+import { getEonAccessToken, redactKnownSecrets } from "./auth";
+import { connectorUrl, eonFetch, EonHttpError } from "./client";
+import { normalizeConnectorName, readEonConfig } from "./config";
+
+const DEFAULT_MAX_RECORDS = 100;
+const MAX_FIRST_PAGE_RECORDS = 100;
+
+type ConnectorSearchConfig = {
+  path: `/${string}`;
+  queryParameter: string;
+  perPageParameter: string;
+  recordsKey: string;
+  nextPageKey: string;
+};
+
+const CONNECTOR_SEARCH_CONFIGS = {
+  zendesk: {
+    path: "/api/v2/search.json",
+    queryParameter: "query",
+    perPageParameter: "per_page",
+    recordsKey: "results",
+    nextPageKey: "next_page",
+  },
+} as const satisfies Record<string, ConnectorSearchConfig>;
+
+type SupportedConnector = keyof typeof CONNECTOR_SEARCH_CONFIGS;
 
 type SnapshotFile = {
   connector: string;
@@ -26,49 +35,64 @@ type SnapshotFile = {
   recordCount: number;
 };
 
-export async function writeSnapshot(connector: string, query: string): Promise<SnapshotFile> {
+export async function writeSnapshot(
+  connector: string,
+  query: string,
+  options: { maxRecords?: number } = {},
+): Promise<SnapshotFile> {
   const name = normalizeConnectorName(connector);
-  const base = applyBaseTemplate(readEonConfig().baseTemplate, name);
-  const operation = await resolveSearch(name, base);
-  const params = new URLSearchParams();
-  params.set(operation.queryParameter, query);
-  const separator = operation.path.includes("?") ? "&" : "?";
-  const response = await eonFetch(name, `${operation.path}${separator}${params.toString()}`);
-  const contentType = response.headers.get("content-type") ?? "";
-  const body = await response.text();
-  if (!shouldParseJson(contentType, body)) {
-    throw new Error(`Search response was not JSON. content-type: ${contentType || "<absent>"}.`);
-  }
-  let payload: unknown;
-  try {
-    payload = JSON.parse(body.replace(/^\uFEFF/, "")) as unknown;
-  } catch {
-    throw new Error("Search response was not JSON.");
+  const searchQuery = query.trim();
+  if (!searchQuery) throw new Error("Search query must not be empty.");
+  const maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS;
+  if (!Number.isSafeInteger(maxRecords) || maxRecords <= 0) {
+    throw new Error("--max-records must be a positive integer.");
   }
 
-  const reportedTenant = findReportedValue(payload, ["tenant"]);
-  const dayState = findReportedValue(payload, ["dayState", "day_state", "day-state"]);
-  const missing = [
-    reportedTenant === undefined ? "tenant" : undefined,
-    dayState === undefined ? "dayState" : undefined,
-  ].filter((item): item is string => item !== undefined);
-  if (missing.length > 0) {
-    throw new Error(
-      `Connector response did not report ${missing.join(" and ")}. Top-level keys: ${topLevelKeys(payload)}.`,
-    );
+  const search = connectorSearchConfig(name);
+  const config = readEonConfig();
+  const base = connectorUrl(config.baseTemplate, name, "/");
+  const firstUrl = connectorUrl(config.baseTemplate, name, search.path);
+  firstUrl.searchParams.set(search.queryParameter, searchQuery);
+  firstUrl.searchParams.set(
+    search.perPageParameter,
+    String(Math.min(maxRecords, MAX_FIRST_PAGE_RECORDS)),
+  );
+  const visited = new Set<string>();
+  const records: unknown[] = [];
+  let nextUrl: URL | null = firstUrl;
+
+  while (nextUrl && records.length < maxRecords) {
+    assertSafePageUrl(nextUrl, base.origin);
+    const pageKey = nextUrl.toString();
+    if (visited.has(pageKey)) {
+      throw new Error("Search pagination loop detected in next_page.");
+    }
+    visited.add(pageKey);
+
+    const response = await eonFetch(name, `${nextUrl.pathname}${nextUrl.search}`, { method: "GET" });
+    const payload = await readJsonResponse(response);
+    const pageRecords = isRecord(payload) ? payload[search.recordsKey] : undefined;
+    if (!Array.isArray(pageRecords)) {
+      throw new Error(
+        `Search response did not contain a ${search.recordsKey} record array.`,
+      );
+    }
+    records.push(...pageRecords.slice(0, maxRecords - records.length));
+
+    nextUrl = nextPage(payload, search, base.origin);
   }
 
-  const records = findRecords(payload);
+  const auth = await getEonAccessToken(name);
   const fetchedAt = new Date().toISOString();
   const fileName = `${fetchedAt.replaceAll(":", "-").replaceAll(".", "-")}.json`;
   const directory = path.join(fixturesRoot(), name);
   await mkdir(directory, { recursive: true });
   const document = {
-    tenant: reportedTenant,
+    tenant: auth.tenant,
     connector: name,
-    dayState,
+    dayState: config.dayState ?? null,
     fetchedAt,
-    query,
+    query: searchQuery,
     recordCount: records.length,
     records,
   };
@@ -80,147 +104,51 @@ export async function writeSnapshot(connector: string, query: string): Promise<S
   return { connector: name, fileName, recordCount: records.length };
 }
 
-async function resolveSearch(connector: string, base: URL): Promise<SearchOperation> {
-  const stored = await readStoredOpenApi(connector);
-  if (stored !== undefined) {
-    const operation = findSearchOperation(stored, base.origin);
-    if (!operation) {
-      throw new Error(
-        `Stored OpenAPI document does not advertise a GET search or list operation with a query parameter. Operations: ${describeOperations(stored)}.`,
-      );
-    }
-    return operation;
-  }
-  return discoverLiveSearch(connector, base);
-}
-
-async function discoverLiveSearch(connector: string, base: URL): Promise<SearchOperation> {
-  const response = await connectorRequest(connector, "/");
-  const contentType = response.headers.get("content-type") ?? "";
-  const body = await response.text();
-  const linkRels = parseLinkHeader(response.headers.get("link")).map((link) => link.rel || "<none>");
-  const challenge = response.headers.get("www-authenticate");
-  const notes = [
-    `HTTP ${response.status}`,
-    `content-type: ${contentType || "<absent>"}`,
-    `link rels: ${linkRels.join(", ") || "<none>"}`,
-    ...(challenge ? [`www-authenticate: ${redactKnownSecrets(challenge)}`] : []),
-  ];
-  const parsed = shouldParseJson(contentType, body) ? tryParse(body) : undefined;
-  if (parsed === undefined) notes.push("body was not JSON");
-  else notes.push(`top-level keys: ${topLevelKeys(parsed)}`);
-
-  if (isOpenApiDocument(parsed)) {
-    const operation = findSearchOperation(parsed, base.origin);
-    if (operation) return operation;
-    notes.push(`operations: ${describeOperations(parsed)}`);
-  }
-
-  const matches: SearchOperation[] = [];
-  const links = [...parseLinkHeader(response.headers.get("link")), ...collectReferences(parsed)];
-  for (const link of links) {
-    if (!hasRel(link, SEARCH_RELS)) continue;
-    if (isForeign(link.href, base)) {
-      notes.push("a search link pointed at another origin");
-      continue;
-    }
-    const operation = referenceSearch(link.href);
-    if (operation) matches.push(operation);
-    else notes.push(`search link ${safePath(link.href)} did not name a query parameter`);
-  }
-
-  const unique = dedupe(matches);
-  const only = unique[0];
-  if (unique.length === 1 && only) return only;
-  if (unique.length > 1) {
+function connectorSearchConfig(connector: string): ConnectorSearchConfig {
+  if (!Object.hasOwn(CONNECTOR_SEARCH_CONFIGS, connector)) {
     throw new Error(
-      `Connector advertised more than one search operation (${unique.map((item) => `${item.path} ${item.queryParameter}`).join("; ")}). ${notes.join(". ")}.`,
+      `Unsupported connector "${connector}". Supported connectors: ${Object.keys(CONNECTOR_SEARCH_CONFIGS).join(", ")}.`,
     );
   }
-  throw new Error(`Connector did not advertise a search operation. ${notes.join(". ")}.`);
+  return CONNECTOR_SEARCH_CONFIGS[connector as SupportedConnector];
 }
 
-function findReportedValue(root: unknown, names: readonly string[]): unknown {
-  const wanted = new Set(names.map((name) => name.toLowerCase()));
-  const queue: unknown[] = [root];
-  const seen = new Set<unknown>();
-  for (let depth = 0; depth < 8 && queue.length > 0; depth += 1) {
-    const width = queue.length;
-    for (let index = 0; index < width; index += 1) {
-      const current = queue.shift();
-      if (!current || typeof current !== "object" || seen.has(current)) continue;
-      seen.add(current);
-      if (Array.isArray(current)) {
-        queue.push(...current.slice(0, 30));
-        continue;
-      }
-      for (const [key, value] of Object.entries(current)) {
-        if (wanted.has(key.toLowerCase()) && value !== undefined && value !== null) return value;
-        queue.push(value);
-      }
-    }
+function nextPage(
+  payload: unknown,
+  search: ConnectorSearchConfig,
+  expectedOrigin: string,
+): URL | null {
+  const value = isRecord(payload) ? payload[search.nextPageKey] : undefined;
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value !== "string") {
+    throw new Error(`Search response ${search.nextPageKey} must be a URL or null.`);
   }
-  return undefined;
-}
-
-function findRecords(payload: unknown): unknown[] {
-  if (Array.isArray(payload)) return payload;
-  if (!isRecord(payload)) return [];
-  const keys = ["results", "items", "records", "data", "matches", "hits", "entries", "value"];
-  for (const key of keys) {
-    const candidate = payload[key];
-    if (Array.isArray(candidate)) return candidate;
-  }
-  for (const value of Object.values(payload)) {
-    if (!isRecord(value)) continue;
-    for (const key of keys) {
-      if (key === "value") continue;
-      const candidate = value[key];
-      if (Array.isArray(candidate)) return candidate;
-    }
-  }
-  return [];
-}
-
-function dedupe(operations: SearchOperation[]): SearchOperation[] {
-  const seen = new Set<string>();
-  const unique: SearchOperation[] = [];
-  for (const operation of operations) {
-    const key = `${operation.path}?${operation.queryParameter}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    unique.push(operation);
-  }
-  return unique;
-}
-
-function isForeign(href: string, base: URL): boolean {
-  const bare = href.split("{")[0] ?? href;
-  if (!bare.startsWith("https://") && !bare.startsWith("http://")) return false;
+  let url: URL;
   try {
-    return new URL(bare).origin !== base.origin;
+    url = new URL(value, expectedOrigin);
   } catch {
-    return true;
+    throw new Error("Search response next_page was not a valid URL.");
+  }
+  assertSafePageUrl(url, expectedOrigin);
+  return url;
+}
+
+function assertSafePageUrl(url: URL, expectedOrigin: string): void {
+  if (url.protocol !== "https:" || url.origin !== expectedOrigin || url.username || url.password) {
+    throw new Error("Refusing next_page outside the expected connector HTTPS origin.");
   }
 }
 
-function safePath(href: string): string {
-  const bare = href.split("?")[0]?.split("{")[0] ?? href;
-  if (bare.startsWith("https://") || bare.startsWith("http://")) {
-    try {
-      return new URL(bare).pathname;
-    } catch {
-      return "<unparsed>";
-    }
+async function readJsonResponse(response: Response): Promise<unknown> {
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (!contentType.includes("json")) {
+    await response.body?.cancel();
+    throw new Error(`Search response was not JSON. content-type: ${contentType || "<absent>"}.`);
   }
-  return bare;
-}
-
-function tryParse(text: string): unknown {
   try {
-    return JSON.parse(text.replace(/^\uFEFF/, "")) as unknown;
+    return await response.json();
   } catch {
-    return undefined;
+    throw new Error("Search response was not valid JSON.");
   }
 }
 
@@ -232,38 +160,57 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function runCli(): Promise<void> {
-  const connector = process.argv[2];
-  const query = process.argv.slice(3).join(" ").trim();
-  if (!connector || !query) {
-    console.error("Usage: bun run snapshot -- <connector> <query>");
-    process.exitCode = 1;
-    return;
+function parseCli(args: string[]): { connector: string; query: string; maxRecords: number } | undefined {
+  const connector = args.shift();
+  const queryParts: string[] = [];
+  let maxRecords = DEFAULT_MAX_RECORDS;
+  while (args.length > 0) {
+    const item = args.shift();
+    if (item === "--max-records") {
+      const raw = args.shift();
+      if (!raw || !/^[1-9]\d*$/.test(raw)) throw new Error("--max-records must be a positive integer.");
+      maxRecords = Number(raw);
+      if (!Number.isSafeInteger(maxRecords)) throw new Error("--max-records must be a positive integer.");
+    } else if (item?.startsWith("--")) {
+      throw new Error(`Unknown option: ${item}`);
+    } else if (item) {
+      queryParts.push(item);
+    }
   }
+  const query = queryParts.join(" ").trim();
+  return connector && query ? { connector, query, maxRecords } : undefined;
+}
+
+async function runCli(): Promise<void> {
   try {
-    const written = await writeSnapshot(connector, query);
+    const parsed = parseCli(process.argv.slice(2));
+    if (!parsed) {
+      printUsage();
+      process.exitCode = 1;
+      return;
+    }
+    const written = await writeSnapshot(parsed.connector, parsed.query, {
+      maxRecords: parsed.maxRecords,
+    });
     console.log(`Wrote ${written.recordCount} records to fixtures/${written.connector}/${written.fileName}`);
   } catch (error) {
-    if (error instanceof EonHttpError) {
-      const challenge = error.headers["www-authenticate"];
-      console.error(error.message);
-      if (challenge) console.error(`www-authenticate: ${challenge}`);
-      if (error.body) console.error(error.body.slice(0, 500));
-    } else {
-      console.error(error instanceof Error ? error.message : "Snapshot failed.");
-    }
+    if (error instanceof EonHttpError) console.error(error.message);
+    else console.error(error instanceof Error ? error.message : "Snapshot failed.");
     process.exitCode = 1;
   }
+}
+
+function printUsage(): void {
+  console.error("Usage: bun run snapshot -- <connector> <search-query> [--max-records N]");
+  console.error("  connector: supported connector name");
+  console.error('  search-query: non-empty query; quote queries containing spaces (for example, "type:ticket status:open")');
 }
 
 function isCliEntry(): boolean {
   const meta = import.meta as ImportMeta & { main?: boolean };
   if (typeof meta.main === "boolean") return meta.main;
   const entry = process.argv[1];
-  if (!entry) return false;
-  return path.resolve(entry) === fileURLToPath(import.meta.url);
+  return entry !== undefined && path.resolve(entry) === fileURLToPath(import.meta.url);
 }
 
-if (isCliEntry()) {
-  await runCli();
-}
+if (isCliEntry()) await runCli();

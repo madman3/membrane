@@ -12,7 +12,7 @@ import {
   decisionSchema,
 } from "./decision";
 
-export const DATASET_NAME = "real-eon-stale-config-verdict-v2";
+export const DATASET_NAME = "nectarvale-sheet-v1";
 export const REPETITIONS = 5;
 
 export type AgentName = "support" | "triage";

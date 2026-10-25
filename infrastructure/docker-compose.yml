@@ -1,0 +1,23 @@
+# Local SurrealDB for the memory evaluation platform.
+# The engine image uses `start`. The Surreal launcher on a host uses `surreal db start`.
+name: memeval
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v3.3.4
+    ports:
+      - "8000:8000"
+    volumes:
+      - surrealdb-data:/data
+    command:
+      - start
+      - --username
+      - ${SURREAL_USER:-root}
+      - --password
+      - ${SURREAL_PASS:-root}
+      - --bind
+      - 0.0.0.0:8000
+      - rocksdb:/data/memeval.db
+
+volumes:
+  surrealdb-data:

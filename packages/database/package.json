@@ -1,0 +1,22 @@
+{
+  "name": "@memeval/database",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "migrate": "bun --env-file=../../.env src/migrate.ts",
+    "seed": "bun --env-file=../../.env src/seed.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@memeval/contracts": "workspace:*",
+    "surrealdb": "2.1.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

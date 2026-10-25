@@ -1,0 +1,20 @@
+{
+  "name": "@memeval/eon",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "openapi": "bun --env-file=../../.env src/openapi.ts",
+    "snapshot": "bun --env-file=../../.env src/snapshot.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "typescript": "5.9.3"
+  }
+}

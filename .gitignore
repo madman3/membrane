@@ -1,0 +1,9 @@
+node_modules
+.next
+dist
+.env
+.data
+.DS_Store
+*.log
+# Fetched connector snapshots are data, not source. Schema JSON stays trackable.
+packages/eon/fixtures/**/*.json

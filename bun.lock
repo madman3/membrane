@@ -23,6 +23,7 @@
       "name": "@memeval/web",
       "dependencies": {
         "@memeval/contracts": "workspace:*",
+        "@memeval/repo-paths": "workspace:*",
         "next": "16.4.3",
         "react": "19.3.1",
         "react-dom": "19.3.1",
@@ -59,6 +60,7 @@
     "packages/eon": {
       "name": "@memeval/eon",
       "dependencies": {
+        "@memeval/repo-paths": "workspace:*",
         "zod": "4.6.7",
       },
       "devDependencies": {
@@ -73,8 +75,16 @@
         "@arizeai/openinference-instrumentation-anthropic": "1.0.0",
         "@arizeai/phoenix-client": "7.16.2",
         "@arizeai/phoenix-otel": "2.3.0",
+        "@memeval/repo-paths": "workspace:*",
         "zod": "4.6.7",
       },
+      "devDependencies": {
+        "@types/node": "24.10.1",
+        "typescript": "5.9.3",
+      },
+    },
+    "packages/repo-paths": {
+      "name": "@memeval/repo-paths",
       "devDependencies": {
         "@types/node": "24.10.1",
         "typescript": "5.9.3",
@@ -177,6 +187,8 @@
     "@memeval/eon": ["@memeval/eon@workspace:packages/eon"],
 
     "@memeval/evals": ["@memeval/evals@workspace:packages/evals"],
+
+    "@memeval/repo-paths": ["@memeval/repo-paths@workspace:packages/repo-paths"],
 
     "@memeval/web": ["@memeval/web@workspace:apps/web"],
 

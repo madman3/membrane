@@ -1,6 +1,7 @@
 "use client";
 
 import type { MemoryCandidateDetail } from "@memeval/contracts";
+import Link from "next/link";
 import { useState, type FormEvent } from "react";
 import { formatDate, statusLabel } from "../lib/format";
 
@@ -68,6 +69,9 @@ export function CandidateDetail({ candidate, onAddVersion }: CandidateDetailProp
             <button type="button" className="link-button" onClick={() => void copyId()}>
               {copied ? "Copied" : "Copy id"}
             </button>
+            <Link className="link-button" href="/impact">
+              View memory impact
+            </Link>
           </div>
         </div>
       </header>

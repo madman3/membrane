@@ -11,6 +11,10 @@ import type {
   RanExperiment,
 } from "@arizeai/phoenix-client/types/experiments";
 import { getExperimentUrl } from "@arizeai/phoenix-client/utils/urlUtils";
+import { randomUUID } from "node:crypto";
+import { mkdir, rename, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   DATASET_NAME,
@@ -21,14 +25,52 @@ import {
   type CaseType,
 } from "./cases";
 import { readEvalConfig } from "./config";
-import { decisionOutputFormat, decisionSchema } from "./decision";
+import { decisionOutputFormat, decisionSchema, type Decision } from "./decision";
 import { EVALUATOR_NAME, gradeDecision, isCaseType } from "./grade";
-import { decideVerdict, type Verdict } from "./verdict";
+import {
+  decideVerdict,
+  verdictBranch,
+  type Verdict,
+  type VerdictBranch,
+} from "./verdict";
 
+const USAGE =
+  "Usage: bun run eval:run [--cases <directory-or-csv>]\n" +
+  "CSV inputs load memory.txt from the CSV file's parent directory.";
+
+function parseCliArgs(args: string[]): { casesPath?: string } {
+  let casesPath: string | undefined;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index] ?? "";
+    if (argument === "--cases") {
+      const value = args[index + 1];
+      if (!value || value.startsWith("-")) {
+        throw new Error(`--cases requires a path.\n${USAGE}`);
+      }
+      if (casesPath !== undefined) {
+        throw new Error(`--cases may only be specified once.\n${USAGE}`);
+      }
+      casesPath = value;
+      index += 1;
+    } else if (argument.startsWith("--cases=")) {
+      const value = argument.slice("--cases=".length);
+      if (!value) throw new Error(`--cases requires a path.\n${USAGE}`);
+      if (casesPath !== undefined) {
+        throw new Error(`--cases may only be specified once.\n${USAGE}`);
+      }
+      casesPath = value;
+    } else {
+      throw new Error(`Unknown argument: ${argument || "(empty)"}.\n${USAGE}`);
+    }
+  }
+  return casesPath === undefined ? {} : { casesPath };
+}
+
+const cli = parseCliArgs(process.argv.slice(2));
+const loaded = await loadDecisionExamples(cli.casesPath);
 const config = readEvalConfig();
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 const client = createClient({ options: { baseUrl: config.phoenixBaseUrl } });
-const loaded = await loadDecisionExamples();
 const caseIds = loaded.examples.map((example) => example.id);
 
 function normalizePreview(value: string, limit?: number): string {
@@ -36,14 +78,19 @@ function normalizePreview(value: string, limit?: number): string {
   return limit === undefined ? normalized : Array.from(normalized).slice(0, limit).join("");
 }
 
-for (const example of loaded.examples.filter((item) => item.metadata.preview === true)) {
-  const match = /^Subject: (.*)\nDescription: ([\s\S]*)$/u.exec(example.input.ticket);
-  if (!match) throw new Error(`Preview case ${example.id} has malformed fixture ticket text.`);
+function ticketDetails(ticket: string, caseId: string): { subject: string; description: string } {
+  const match = /^Subject: (.*)\nDescription: ([\s\S]*)$/u.exec(ticket);
+  if (!match) throw new Error(`Case ${caseId} has malformed fixture ticket text.`);
   const subject = match[1];
   const description = match[2];
   if (subject === undefined || description === undefined) {
-    throw new Error(`Preview case ${example.id} lacks fixture subject or description.`);
+    throw new Error(`Case ${caseId} lacks fixture subject or description.`);
   }
+  return { subject, description };
+}
+
+for (const example of loaded.examples.filter((item) => item.metadata.preview === true)) {
+  const { subject, description } = ticketDetails(example.input.ticket, example.id);
   console.log(`Untrusted ticket preview (${example.id}):`);
   console.log(`Subject [untrusted]: ${normalizePreview(subject)}`);
   console.log(`Description [untrusted, first 200 chars]: ${normalizePreview(description, 200)}`);
@@ -154,8 +201,45 @@ async function callClaude(example: Example, memory: string): Promise<unknown> {
   }
 }
 
-const controlTask = (example: Example): Promise<unknown> => callClaude(example, "");
-const treatmentTask = (example: Example): Promise<unknown> => callClaude(example, loaded.memory);
+type RecordedTask = {
+  task: (example: Example) => Promise<Decision>;
+  decisions: Map<string, Array<Decision | undefined>>;
+};
+
+function createRecordedTask(memory: string): RecordedTask {
+  const decisions = new Map(
+    caseIds.map((caseId) => [caseId, new Array<Decision | undefined>(REPETITIONS)]),
+  );
+  const nextRepetition = new Map(caseIds.map((caseId) => [caseId, 0]));
+
+  const task = async (example: Example): Promise<Decision> => {
+    const caseId = example.metadata?.case_id;
+    if (typeof caseId !== "string" || !decisions.has(caseId)) {
+      throw new Error("MALFORMED: task example has an unknown case_id.");
+    }
+    // Phoenix queues each case's repetitions in ascending order, but returns runs in
+    // completion order. Reserve the slot synchronously before the model call so the
+    // persisted decisions retain stable repetition order.
+    const repetitionIndex = nextRepetition.get(caseId) ?? 0;
+    nextRepetition.set(caseId, repetitionIndex + 1);
+    if (repetitionIndex >= REPETITIONS) {
+      throw new Error(`MALFORMED: case ${caseId} exceeded ${REPETITIONS} repetitions.`);
+    }
+
+    const output = await callClaude(example, memory);
+    const parsed = decisionSchema.safeParse(output);
+    if (!parsed.success) {
+      throw new Error(`MALFORMED: case ${caseId} returned an unparsed decision.`);
+    }
+    decisions.get(caseId)?.splice(repetitionIndex, 1, parsed.data);
+    return parsed.data;
+  };
+
+  return { task, decisions };
+}
+
+const controlTask = createRecordedTask("");
+const treatmentTask = createRecordedTask(loaded.memory);
 
 function experimentUrl(experiment: RanExperiment): string {
   return getExperimentUrl({
@@ -227,7 +311,8 @@ function infrastructureErrors(experiment: RanExperiment): string[] {
   );
 }
 
-const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+const runAt = new Date().toISOString();
+const stamp = runAt.replace(/[:.]/g, "-");
 console.log(`Running ${caseIds.length} real-fixture decision cases with model ${config.model}.`);
 
 const control = await runExperiment({
@@ -236,7 +321,7 @@ const control = await runExperiment({
   experimentName: `real-eon-control-${stamp}`,
   experimentDescription: "Real Eon fixture cases with empty memory.",
   experimentMetadata: { condition: "control", fixture: "eon-zendesk", model: config.model },
-  task: controlTask,
+  task: controlTask.task,
   evaluators: [decisionFields],
   repetitions: REPETITIONS,
 });
@@ -247,7 +332,7 @@ const treatment = await runExperiment({
   experimentName: `real-eon-treatment-${stamp}`,
   experimentDescription: "Real Eon fixture cases with file-backed memory appended last.",
   experimentMetadata: { condition: "treatment", fixture: "eon-zendesk", model: config.model },
-  task: treatmentTask,
+  task: treatmentTask.task,
   evaluators: [decisionFields],
   repetitions: REPETITIONS,
 });
@@ -263,7 +348,22 @@ if (infraErrors.length > 0) throw new Error(infraErrors.join("\n"));
 const controlOutcomes = runsFor(control);
 const treatmentOutcomes = runsFor(treatment);
 const countsByAgent = new Map<AgentName, Record<Verdict, number>>();
-const firedBranches = new Set<"INCONCLUSIVE" | "PASS-helped" | "PASS-no-harm" | "FAIL-flip">();
+const firedBranches = new Set<VerdictBranch>();
+type CaseResultBase = {
+  id: string;
+  agent: AgentName;
+  ticketId: string;
+  caseType: CaseType;
+  ticketSubject: string;
+  ticketDescription: string;
+  expected: Record<string, unknown>;
+  gradedFields: string[];
+  controlPasses: number;
+  treatmentPasses: number;
+  verdict: Verdict;
+  verdictReason: string;
+};
+const caseResults: CaseResultBase[] = [];
 let anyMalformed = false;
 
 for (const caseId of caseIds) {
@@ -284,15 +384,30 @@ for (const caseId of caseIds) {
   const counts = countsByAgent.get(agent) ?? {
     PASS: 0,
     FAIL: 0,
+    INSUFFICIENT: 0,
     NEUTRAL: 0,
     INCONCLUSIVE: 0,
   };
   counts[result.verdict] += 1;
   countsByAgent.set(agent, counts);
-  if (result.verdict === "INCONCLUSIVE") firedBranches.add("INCONCLUSIVE");
-  else if (result.reason === "memory helped") firedBranches.add("PASS-helped");
-  else if (result.reason === "no harm done") firedBranches.add("PASS-no-harm");
-  else if (result.reason === "memory harmed, FLIP") firedBranches.add("FAIL-flip");
+  firedBranches.add(verdictBranch({ ...result, caseType }));
+  const loadedExample = loaded.examples.find((item) => item.id === caseId);
+  if (!loadedExample) throw new Error(`Loaded fixtures are missing case ${caseId}.`);
+  const ticket = ticketDetails(loadedExample.input.ticket, caseId);
+  caseResults.push({
+    id: caseId,
+    agent,
+    ticketId: loadedExample.input.ticket_id,
+    caseType,
+    ticketSubject: ticket.subject,
+    ticketDescription: ticket.description,
+    expected: loadedExample.output,
+    gradedFields: [...loadedExample.metadata.graded_fields],
+    controlPasses,
+    treatmentPasses,
+    verdict: result.verdict,
+    verdictReason: result.reason,
+  });
   console.log(
     `${caseId} / ${agent} / ${caseType}: control ${controlPasses}/${REPETITIONS} -> treatment ${treatmentPasses}/${REPETITIONS} = ${result.verdict} (${result.reason})`,
   );
@@ -302,7 +417,7 @@ for (const agent of ["support", "triage"] as const) {
   const counts = countsByAgent.get(agent);
   if (counts) {
     console.log(
-      `Summary ${agent}: PASS ${counts.PASS}, FAIL ${counts.FAIL}, NEUTRAL ${counts.NEUTRAL}, INCONCLUSIVE ${counts.INCONCLUSIVE}`,
+      `Summary ${agent}: PASS ${counts.PASS}, FAIL ${counts.FAIL}, INSUFFICIENT ${counts.INSUFFICIENT}, NEUTRAL ${counts.NEUTRAL}, INCONCLUSIVE ${counts.INCONCLUSIVE}`,
     );
   }
 }
@@ -438,8 +553,134 @@ if (!controlSpanOk || !treatmentSpanOk) {
   );
 }
 if (anyMalformed) process.exitCode = 2;
-const branchOrder = ["INCONCLUSIVE", "PASS-helped", "PASS-no-harm", "FAIL-flip"] as const;
+const branchOrder = [
+  "PASS-helped",
+  "PASS-no-harm",
+  "FAIL-worse",
+  "FAIL-flip",
+  "INSUFFICIENT",
+  "NEUTRAL",
+  "INCONCLUSIVE",
+] as const satisfies readonly VerdictBranch[];
 console.log(`Verdict branches fired: ${branchOrder.filter((label) => firedBranches.has(label)).join(", ")}`);
+
+type ResultArtifactCase = CaseResultBase & {
+  controlDecisions: Decision[];
+  treatmentDecisions: Decision[];
+};
+
+type ResultArtifact = {
+  memory: string;
+  model: string;
+  effort: "medium";
+  runAt: string;
+  repetitions: number;
+  phoenix: {
+    datasetId: string;
+    controlExperimentId: string;
+    treatmentExperimentId: string;
+  };
+  byAgent: Record<
+    string,
+    { pass: number; fail: number; insufficient: number; neutral: number; inconclusive: number }
+  >;
+  cases: ResultArtifactCase[];
+};
+
+function requireRecordedDecisions(
+  recorded: Map<string, Array<Decision | undefined>>,
+  caseId: string,
+  arm: "control" | "treatment",
+): Decision[] {
+  const slots = recorded.get(caseId);
+  const decisions: Decision[] = [];
+  for (let index = 0; index < REPETITIONS; index += 1) {
+    const decision = slots?.[index];
+    if (!decision) {
+      // Never invent a decision for a malformed task run. The artifact contract
+      // requires five real parsed decisions, so an incomplete artifact is not written.
+      throw new Error(
+        `${arm} case ${caseId} has no parsed decision for repetition ${index + 1}/${REPETITIONS}`,
+      );
+    }
+    decisions.push(decision);
+  }
+  if (slots?.length !== REPETITIONS) {
+    throw new Error(`${arm} case ${caseId} recorded ${slots?.length ?? 0} decision slots`);
+  }
+  return decisions;
+}
+
+async function writeResultArtifact(artifact: ResultArtifact): Promise<{
+  latestPath: string;
+  timestampedPath: string;
+}> {
+  const resultsDirectory = fileURLToPath(new URL("../results", import.meta.url));
+  await mkdir(resultsDirectory, { recursive: true });
+  const contents = `${JSON.stringify(artifact, null, 2)}\n`;
+  const safeTimestamp = artifact.runAt.replace(/[:.]/gu, "-");
+  const timestampedPath = path.join(
+    resultsDirectory,
+    `${safeTimestamp}-${randomUUID()}.json`,
+  );
+  const latestPath = path.join(resultsDirectory, "latest.json");
+  const temporaryLatestPath = path.join(
+    resultsDirectory,
+    `.latest-${process.pid}-${randomUUID()}.tmp`,
+  );
+
+  await writeFile(timestampedPath, contents, { encoding: "utf8", flag: "wx" });
+  try {
+    await writeFile(temporaryLatestPath, contents, { encoding: "utf8", flag: "wx" });
+    await rename(temporaryLatestPath, latestPath);
+  } finally {
+    await rm(temporaryLatestPath, { force: true });
+  }
+  return { latestPath, timestampedPath };
+}
+
+let artifactCases: ResultArtifactCase[] | undefined;
+try {
+  artifactCases = caseResults.map((result) => ({
+    ...result,
+    controlDecisions: requireRecordedDecisions(controlTask.decisions, result.id, "control"),
+    treatmentDecisions: requireRecordedDecisions(treatmentTask.decisions, result.id, "treatment"),
+  }));
+} catch (error) {
+  if (!anyMalformed) throw error;
+  const detail = error instanceof Error ? error.message : "missing parsed decisions";
+  console.error(`Result artifact not written: ${detail}.`);
+}
+
+if (artifactCases) {
+  const byAgent = Object.fromEntries(
+    [...countsByAgent.entries()].map(([agent, counts]) => [
+      agent,
+      {
+        pass: counts.PASS,
+        fail: counts.FAIL,
+        insufficient: counts.INSUFFICIENT,
+        neutral: counts.NEUTRAL,
+        inconclusive: counts.INCONCLUSIVE,
+      },
+    ]),
+  );
+  const written = await writeResultArtifact({
+    memory: loaded.memory,
+    model: config.model,
+    effort: "medium",
+    runAt,
+    repetitions: REPETITIONS,
+    phoenix: {
+      datasetId: dataset.id,
+      controlExperimentId: control.id,
+      treatmentExperimentId: treatment.id,
+    },
+    byAgent,
+    cases: artifactCases,
+  });
+  console.log(`Result artifacts: ${written.latestPath} and ${written.timestampedPath}`);
+}
 
 function assertDatasetCases(examples: ExampleWithId[], expectedIds: Set<string>): void {
   const actual = new Set(

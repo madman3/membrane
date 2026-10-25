@@ -7,3 +7,5 @@ dist
 *.log
 # Fetched connector snapshots are data, not source. Schema JSON stays trackable.
 packages/eon/fixtures/**/*.json
+packages/evals/results/
+apps/web/tsconfig.tsbuildinfo

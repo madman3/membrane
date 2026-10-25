@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,11 +13,11 @@ import {
   decisionSchema,
 } from "./decision";
 
-export const DATASET_NAME = "real-eon-stale-config-verdict-v2";
 export const REPETITIONS = 5;
 
 export type AgentName = "support" | "triage";
 export type CaseType = "HELP" | "HARM_CHECK";
+export type CaseSourceType = "csv" | "directory";
 
 const caseSchema = z.object({
   id: z.string().min(1),
@@ -87,6 +88,8 @@ ${AGENT_INSTRUCTIONS}
 export async function loadDecisionExamples(casesPath = casesRoot()): Promise<{
   examples: DecisionExample[];
   memory: string;
+  sourcePath: string;
+  sourceType: CaseSourceType;
 }> {
   const resolvedPath = resolveExistingPath(casesPath, {
     from: import.meta.url,
@@ -105,9 +108,11 @@ export async function loadDecisionExamples(casesPath = casesRoot()): Promise<{
   let cases: CaseFile[];
   let memoryDirectory: string;
   let csvInput = false;
+  let sourceType: CaseSourceType;
   if (sourceStat.isDirectory()) {
     cases = await loadJsonCases(resolvedPath);
     memoryDirectory = resolvedPath;
+    sourceType = "directory";
   } else if (sourceStat.isFile()) {
     if (path.extname(resolvedPath).toLowerCase() !== ".csv") {
       throw new Error(`Cases file must have a .csv extension: ${resolvedPath}.`);
@@ -115,6 +120,7 @@ export async function loadDecisionExamples(casesPath = casesRoot()): Promise<{
     cases = parseCsvCases(await readFile(resolvedPath, "utf8"), resolvedPath);
     memoryDirectory = path.dirname(resolvedPath);
     csvInput = true;
+    sourceType = "csv";
   } else {
     throw new Error(`Cases path must be a directory or .csv file: ${resolvedPath}.`);
   }
@@ -162,7 +168,7 @@ export async function loadDecisionExamples(casesPath = casesRoot()): Promise<{
     throw error;
   }
   if (!memory) throw new Error(`Eval memory file must not be empty: ${memoryPath}.`);
-  return { examples, memory };
+  return { examples, memory, sourcePath: resolvedPath, sourceType };
 }
 
 async function loadJsonCases(root: string): Promise<CaseFile[]> {
@@ -183,10 +189,24 @@ async function loadJsonCases(root: string): Promise<CaseFile[]> {
       cases.push(parsed.data);
     }
   }
-  if (cases.length !== 4) {
-    throw new Error(`Real-fixture eval requires exactly 4 cases; loaded ${cases.length}.`);
+  if (cases.length === 0) {
+    throw new Error(`Case JSON files in ${root} must contain at least one case.`);
   }
   return cases;
+}
+
+export function deriveDatasetName(
+  sourcePath: string,
+  sourceType: CaseSourceType,
+  caseIds: readonly string[],
+): string {
+  const basename = path.basename(sourcePath);
+  const sourceName = sourceType === "csv" ? basename.replace(/\.csv$/iu, "") : basename;
+  const sanitizedSource =
+    sourceName.toLowerCase().replace(/[^a-z0-9]+/gu, "-").replace(/^-+|-+$/gu, "") || "cases";
+  const sortedIds = [...caseIds].sort();
+  const hash = createHash("sha256").update(JSON.stringify(sortedIds)).digest("hex").slice(0, 12);
+  return `memory-eval-${sanitizedSource}-${hash}`;
 }
 
 export function parseCsvCases(text: string, source = "CSV input"): CaseFile[] {

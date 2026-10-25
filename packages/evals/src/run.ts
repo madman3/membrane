@@ -17,8 +17,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  DATASET_NAME,
   REPETITIONS,
+  deriveDatasetName,
   loadDecisionExamples,
   renderPrompt,
   type AgentName,
@@ -72,6 +72,7 @@ const config = readEvalConfig();
 const anthropic = new Anthropic({ apiKey: config.anthropicApiKey });
 const client = createClient({ options: { baseUrl: config.phoenixBaseUrl } });
 const caseIds = loaded.examples.map((example) => example.id);
+const datasetName = deriveDatasetName(loaded.sourcePath, loaded.sourceType, caseIds);
 
 function normalizePreview(value: string, limit?: number): string {
   const normalized = value.replace(/\s+/gu, " ").trim();
@@ -100,18 +101,18 @@ async function findOrCreateDataset(): Promise<{ datasetId: string }> {
   try {
     const existing = await getDataset({
       client,
-      dataset: { datasetName: DATASET_NAME },
+      dataset: { datasetName },
     });
     console.log(`Reusing real-fixture dataset ${existing.name} (${existing.id}).`);
     return { datasetId: existing.id };
   } catch (error) {
     const message = error instanceof Error ? error.message : "";
-    if (!message.includes(`Dataset with name ${DATASET_NAME} not found`)) throw error;
+    if (!message.includes(`Dataset with name ${datasetName} not found`)) throw error;
   }
-  console.log(`Creating real-fixture dataset ${DATASET_NAME}.`);
+  console.log(`Creating real-fixture dataset ${datasetName}.`);
   return createDataset({
     client,
-    name: DATASET_NAME,
+    name: datasetName,
     description: "Decision and memory verdict cases resolved from the checked-in Eon Zendesk fixture.",
     examples: loaded.examples,
   });
@@ -691,7 +692,7 @@ function assertDatasetCases(examples: ExampleWithId[], expectedIds: Set<string>)
   );
   if (actual.size !== expectedIds.size || [...expectedIds].some((id) => !actual.has(id))) {
     throw new Error(
-      `Dataset ${DATASET_NAME} exists with different cases; use a new dataset name to preserve history.`,
+      `Dataset ${datasetName} exists with different cases; use a new dataset name to preserve history.`,
     );
   }
 }

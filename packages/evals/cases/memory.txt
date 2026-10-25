@@ -1,1 +1,1 @@
-Promo code engine failures reported since early October 2026 are the known issue tracked in ticket 4000197.
+Promo code engine failures are the known issue tracked in ticket 4000197.
